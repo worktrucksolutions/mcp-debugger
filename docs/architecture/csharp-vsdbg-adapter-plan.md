@@ -109,25 +109,72 @@ vsdbg location varies by platform and installation method:
 
 **Search Strategy:**
 1. Check `VSDBG_PATH` environment variable
-2. Check user-specified path
-3. Search VS Code extensions directory
+2. Check user-specified path (from config)
+3. Search VS Code extensions directory (user and global)
+   - User: `~/.vscode/extensions/` (Linux/macOS) or `%USERPROFILE%\.vscode\extensions\` (Windows)
+   - Global: Platform-specific global extension paths
+   - Search for `ms-dotnettools.csharp-*` extension directories
+   - Check multiple versions (latest preferred)
 4. Search Visual Studio installation (Windows only)
+   - `%ProgramFiles%\Microsoft Visual Studio\*\Common7\IDE\Extensions\*\debugAdapters\vsdbg.exe`
 5. Check common installation paths
+   - May need to search for `.NET Core Debugger` extension as well
+
+**Note**: vsdbg version detection may require:
+- Reading extension manifest/package.json
+- Parsing executable metadata
+- Checking extension directory version numbers
 
 ### .NET SDK Detection
 
 **Required:**
 - .NET SDK 2.1+ (for .NET Core debugging)
-- .NET SDK 5.0+ (for modern .NET debugging)
-- .NET Framework (for Framework debugging on Windows)
+- .NET SDK 5.0+ (for modern .NET debugging) - recommended
+- .NET Framework 4.5+ (for Framework debugging on Windows only)
 
 **Detection Methods:**
-1. Check `DOTNET_ROOT` environment variable
-2. Find `dotnet` command in PATH
-3. Platform-specific paths:
-   - Windows: `%ProgramFiles%\dotnet\dotnet.exe`
-   - Linux: `/usr/share/dotnet/dotnet`
-   - macOS: `/usr/local/share/dotnet/dotnet`
+1. **.NET SDK**:
+   - Check `DOTNET_ROOT` environment variable
+   - Find `dotnet` command in PATH
+   - Platform-specific paths:
+     - Windows: `%ProgramFiles%\dotnet\dotnet.exe`
+     - Linux: `/usr/share/dotnet/dotnet` or `/usr/local/share/dotnet/dotnet`
+     - macOS: `/usr/local/share/dotnet/dotnet`
+   - Use `dotnet --version` to get SDK version
+   - Use `dotnet --list-runtimes` to verify runtime installation
+
+2. **.NET Framework** (Windows only):
+   - Check registry: `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\NET Framework Setup\NDP\`
+   - Check installed programs
+   - Check for `%WINDIR%\Microsoft.NET\Framework\*` directories
+   - Note: .NET Framework debugging requires Windows-specific vsdbg setup
+
+### vsdbg Communication Method
+
+**CRITICAL**: vsdbg uses **stdio** (NDJSON) for DAP communication, NOT TCP like debugpy.
+
+The adapter manager spawns vsdbg with stdio communication:
+- vsdbg is invoked with no TCP arguments (no `--host`/`--port`)
+- DAP messages are sent/received via stdin/stdout (NDJSON format)
+- The adapter manager handles stdio communication
+- vsdbg may output logs to stderr (separate from DAP protocol)
+
+**Command Building:**
+```typescript
+buildAdapterCommand(config: AdapterConfig): AdapterCommand {
+  return {
+    command: config.executablePath,
+    args: [],  // vsdbg uses stdio, no TCP args needed
+    env: {
+      ...process.env,
+      // vsdbg-specific environment variables if needed
+      // May need to configure logging to avoid stdout pollution
+    }
+  };
+}
+```
+
+**Important**: Ensure vsdbg logging doesn't pollute stdout (must be NDJSON-only per DAP spec).
 
 ### Launch Configuration
 
@@ -135,7 +182,7 @@ vsdbg location varies by platform and installation method:
 
 ```typescript
 interface CSharpLaunchConfig extends LanguageSpecificLaunchConfig {
-  type: 'coreclr' | 'clr' | 'netcoredbg';
+  type: 'coreclr' | 'clr';  // Note: 'netcoredbg' is a different debugger, not vsdbg
   request: 'launch' | 'attach';
   program?: string;           // Path to executable
   args?: string[];            // Command-line arguments
@@ -152,6 +199,8 @@ interface CSharpLaunchConfig extends LanguageSpecificLaunchConfig {
   // Additional .NET-specific options
 }
 ```
+
+**Note**: The launch configuration is sent via DAP `launch` request after initialization, not via command-line arguments.
 
 ### Capabilities
 
@@ -176,7 +225,12 @@ vsdbg supports extensive DAP capabilities:
 - `System.Exception`: All exceptions
 - `System.NullReferenceException`: Null reference exceptions
 - `System.ArgumentException`: Argument exceptions
-- Custom exception types
+- `System.ArgumentNullException`: Argument null exceptions
+- `System.IndexOutOfRangeException`: Index out of range exceptions
+- `System.InvalidOperationException`: Invalid operation exceptions
+- Custom exception types (user-defined exceptions)
+
+**Note**: vsdbg supports filtering by exception type name, allowing breakpoints on specific exception types or all exceptions.
 
 **Capabilities Declaration:**
 ```typescript
@@ -498,22 +552,43 @@ export enum DebugLanguage {
 ## Platform-Specific Considerations
 
 ### Windows
-- vsdbg.exe executable
-- Visual Studio installation paths
-- .NET Framework support
-- Windows-specific error messages
+- **Executable**: `vsdbg.exe`
+- **Visual Studio paths**: `%ProgramFiles%\Microsoft Visual Studio\*\Common7\IDE\Extensions\*\debugAdapters\vsdbg.exe`
+- **VS Code paths**: `%USERPROFILE%\.vscode\extensions\ms-dotnettools.csharp-*\debugAdapters\vsdbg.exe`
+- **.NET Framework support**: Available (Windows-only)
+- **Registry checks**: Required for .NET Framework detection
+- **Error messages**: Windows-specific paths and registry references
 
 ### Linux
-- vsdbg executable (no extension)
-- Executable permissions
-- .NET SDK installation paths
-- Linux-specific error messages
+- **Executable**: `vsdbg` (no extension)
+- **VS Code paths**: `~/.vscode/extensions/ms-dotnettools.csharp-*/debugAdapters/vsdbg`
+- **Executable permissions**: Must be executable (chmod +x)
+- **.NET SDK paths**: `/usr/share/dotnet/dotnet` or `/usr/local/share/dotnet/dotnet`
+- **.NET Framework**: Not available (Windows-only)
+- **Error messages**: Linux-specific paths and permission references
 
 ### macOS
-- vsdbg executable (no extension)
-- Executable permissions
-- .NET SDK installation paths
-- macOS-specific error messages
+- **Executable**: `vsdbg` (no extension)
+- **VS Code paths**: `~/.vscode/extensions/ms-dotnettools.csharp-*/debugAdapters/vsdbg`
+- **Executable permissions**: Must be executable
+- **.NET SDK paths**: `/usr/local/share/dotnet/dotnet`
+- **.NET Framework**: Not available (Windows-only)
+- **Error messages**: macOS-specific paths and permission references
+
+## Stdio Mode Requirements
+
+**CRITICAL**: vsdbg must output only NDJSON to stdout (per DAP specification).
+
+**Requirements:**
+- vsdbg logs should be configured to output to stderr or files, not stdout
+- No non-JSON output to stdout (would corrupt DAP protocol)
+- May need to configure vsdbg via environment variables or configuration
+- The adapter manager uses `stdio: ['ignore', 'inherit', 'inherit', 'ipc']` which inherits stdout/stderr
+
+**Configuration:**
+- Check if vsdbg has environment variables for log configuration
+- May need to redirect stderr to log files
+- Ensure vsdbg doesn't output diagnostic messages to stdout
 
 ## Known Challenges
 
@@ -547,14 +622,31 @@ export enum DebugLanguage {
 2. **Symbol Server Support**
    - Configure symbol server for debugging
    - Download symbols automatically
+   - Configure PDB file locations
 
 3. **Source Map Support**
    - Support for source maps in debugging
    - Map generated code to source
 
 4. **Multi-Targeting Support**
-   - Support projects targeting multiple frameworks
+   - Support projects targeting multiple frameworks (TFM)
    - Allow selection of target framework
+   - Auto-detect from project file
+
+5. **Attach Mode Support**
+   - Attach to running processes
+   - Process ID selection
+   - Process name matching
+
+6. **Project Type Auto-Detection**
+   - Automatically detect project type from .csproj/.sln files
+   - Suggest appropriate launch configuration
+   - Validate project compatibility
+
+7. **Container Mode Support**
+   - vsdbg discovery in Docker containers
+   - .NET SDK installation in containers
+   - Path resolution in containerized environments
 
 ## References
 
